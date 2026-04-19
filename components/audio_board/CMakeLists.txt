@@ -4,9 +4,9 @@ idf_component_register(
         "board_pins_config.c"
     INCLUDE_DIRS
         "."
+        "include"
     REQUIRES
         audio_hal
+        audio_sal
         esp_peripherals
-        audio_mem
-        periph_button
 )
