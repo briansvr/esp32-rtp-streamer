@@ -1,4 +1,14 @@
 dependencies:
+  espressif/cmake_utilities:
+    component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 0.5.3
   espressif/dl_fft:
     component_hash: 7dadbd644c0d7ba4733cc3726ec4cff6edf27b043725e1115861dec1609a3d28
     dependencies:
@@ -19,6 +29,20 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.6.0
+  espressif/esp_lcd_ili9341:
+    component_hash: 31f1b793aa2110dd2ae071c21ccbff0a4eb20d9a4ee40b6294c0dc0ad9552c4e
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4'
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: 0.*
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.2.0
   espressif/esp_websocket_client:
     component_hash: c5a067a9fddea370c478017e66fac302f4b79c3d4027e9bdd42a019786cceb92
     dependencies:
@@ -66,11 +90,12 @@ dependencies:
 direct_dependencies:
 - espressif/dl_fft
 - espressif/esp-dsp
+- espressif/esp_lcd_ili9341
 - espressif/esp_websocket_client
 - espressif/jsmn
 - espressif/nghttp
 - espressif/zlib
 - idf
-manifest_hash: c112b48b6bdff737da60989c4a34847e872b4140f60bdf88f9700c2d3fb7690f
+manifest_hash: 11970a16037abbe97acbb917ed1eaf85f224270143736ef7648c96be188cccc7
 target: esp32
 version: 2.0.0

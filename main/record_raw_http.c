@@ -1,34 +1,22 @@
-/* Record WAV file to SD Card
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
-
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
+#include "esp_netif.h"
 #include "nvs_flash.h"
-
-#include "esp_http_client.h"
+#include "esp_http_server.h"
 #include "sdkconfig.h"
+
 #include "audio_element.h"
 #include "audio_pipeline.h"
-#include "audio_event_iface.h"
 #include "audio_common.h"
 #include "board.h"
-#include "http_stream.h"
 #include "i2s_stream.h"
-#include "wav_encoder.h"
+#include "raw_stream.h"
 #include "esp_peripherals.h"
-#include "periph_button.h"
 #include "periph_wifi.h"
-#include "filter_resample.h"
-#include "input_key_service.h"
 #include "audio_idf_version.h"
 
 #if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 1, 0))
@@ -37,220 +25,204 @@
 #include "tcpip_adapter.h"
 #endif
 
-static const char *TAG = "REC_RAW_HTTP";
+static const char *TAG = "HTTP_AUDIO_SERVER";
 
+#define AUDIO_SAMPLE_RATE   (44100)
+#define AUDIO_BITS          (16)
+#define AUDIO_CHANNELS      (2)
+#define HTTP_PORT           (8080)
+#define STREAM_BUF_SIZE     (4096)
 
-#define EXAMPLE_AUDIO_SAMPLE_RATE  (16000)
-#define EXAMPLE_AUDIO_BITS         (16)
-#define EXAMPLE_AUDIO_CHANNELS     (1)
+static audio_pipeline_handle_t pipeline;
+static audio_element_handle_t  i2s_stream_reader;
+static audio_element_handle_t  raw_writer;
 
-#define DEMO_EXIT_BIT (BIT0)
-static EventGroupHandle_t EXIT_FLAG;
+static SemaphoreHandle_t stream_mutex;   /* garantisce un solo client alla volta */
 
-audio_pipeline_handle_t pipeline;
-audio_element_handle_t i2s_stream_reader;
-audio_element_handle_t http_stream_writer;
+/* ── WAV header per streaming (size = 0x7FFFFFFF) ────────── */
 
-esp_err_t _http_stream_event_handle(http_stream_event_msg_t *msg)
+static void send_wav_header(httpd_req_t *req)
 {
-    esp_http_client_handle_t http = (esp_http_client_handle_t)msg->http_client;
-    char len_buf[16];
-    static int total_write = 0;
+    const uint32_t sr   = AUDIO_SAMPLE_RATE;
+    const uint16_t ch   = AUDIO_CHANNELS;
+    const uint16_t bps  = AUDIO_BITS;
+    const uint32_t br   = sr * ch * (bps / 8);
+    const uint16_t ba   = ch * (bps / 8);
+    const uint32_t INF  = 0x7FFFFFFF;
 
-    if (msg->event_id == HTTP_STREAM_PRE_REQUEST) {
-        // set header
-        ESP_LOGI(TAG, "[ + ] HTTP client HTTP_STREAM_PRE_REQUEST, lenght=%d", msg->buffer_len);
-        esp_http_client_set_method(http, HTTP_METHOD_POST);
-        char dat[10] = {0};
-        snprintf(dat, sizeof(dat), "%d", EXAMPLE_AUDIO_SAMPLE_RATE);
-        esp_http_client_set_header(http, "x-audio-sample-rates", dat);
-        memset(dat, 0, sizeof(dat));
-        snprintf(dat, sizeof(dat), "%d", EXAMPLE_AUDIO_BITS);
-        esp_http_client_set_header(http, "x-audio-bits", dat);
-        memset(dat, 0, sizeof(dat));
-        snprintf(dat, sizeof(dat), "%d", EXAMPLE_AUDIO_CHANNELS);
-        esp_http_client_set_header(http, "x-audio-channel", dat);
-        total_write = 0;
+    uint8_t hdr[44] = {
+        'R','I','F','F',
+        INF & 0xFF, (INF>>8)&0xFF, (INF>>16)&0xFF, (INF>>24)&0xFF,
+        'W','A','V','E',
+        'f','m','t',' ',
+        16,0,0,0,
+        1,0,
+        ch  & 0xFF, (ch >>8)&0xFF,
+        sr  & 0xFF, (sr >>8)&0xFF, (sr >>16)&0xFF, (sr >>24)&0xFF,
+        br  & 0xFF, (br >>8)&0xFF, (br >>16)&0xFF, (br >>24)&0xFF,
+        ba  & 0xFF, (ba >>8)&0xFF,
+        bps & 0xFF, (bps>>8)&0xFF,
+        'd','a','t','a',
+        INF & 0xFF, (INF>>8)&0xFF, (INF>>16)&0xFF, (INF>>24)&0xFF,
+    };
+    httpd_resp_send_chunk(req, (char *)hdr, sizeof(hdr));
+}
+
+/* ── HTTP handler ─────────────────────────────────────────── */
+
+static esp_err_t audio_stream_handler(httpd_req_t *req)
+{
+    if (xSemaphoreTake(stream_mutex, 0) == pdFALSE) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "Already streaming to another client");
         return ESP_OK;
     }
 
-    if (msg->event_id == HTTP_STREAM_ON_REQUEST) {
-        // write data
-        int wlen = sprintf(len_buf, "%x\r\n", msg->buffer_len);
-        if (esp_http_client_write(http, len_buf, wlen) <= 0) {
-            return ESP_FAIL;
-        }
-        if (esp_http_client_write(http, msg->buffer, msg->buffer_len) <= 0) {
-            return ESP_FAIL;
-        }
-        if (esp_http_client_write(http, "\r\n", 2) <= 0) {
-            return ESP_FAIL;
-        }
-        total_write += msg->buffer_len;
-        printf("\033[A\33[2K\rTotal bytes written: %d\n", total_write);
-        return msg->buffer_len;
+    ESP_LOGI(TAG, "Client connected — starting stream");
+
+    httpd_resp_set_type(req, "audio/wav");
+
+    audio_pipeline_run(pipeline);
+    send_wav_header(req);
+
+    char *buf = malloc(STREAM_BUF_SIZE);
+    if (!buf) {
+        audio_pipeline_stop(pipeline);
+        audio_pipeline_wait_for_stop(pipeline);
+        audio_pipeline_terminate(pipeline);
+        xSemaphoreGive(stream_mutex);
+        return ESP_ERR_NO_MEM;
     }
 
-    if (msg->event_id == HTTP_STREAM_POST_REQUEST) {
-        ESP_LOGI(TAG, "[ + ] HTTP client HTTP_STREAM_POST_REQUEST, write end chunked marker");
-        if (esp_http_client_write(http, "0\r\n\r\n", 5) <= 0) {
-            return ESP_FAIL;
+    bool client_ok = true;
+    while (1) {
+        int len = raw_stream_read(raw_writer, buf, STREAM_BUF_SIZE);
+        if (len <= 0) break;   /* pipeline fermata o errore */
+
+        if (httpd_resp_send_chunk(req, buf, len) != ESP_OK) {
+            ESP_LOGI(TAG, "Client disconnected");
+            client_ok = false;
+            break;
         }
-        return ESP_OK;
     }
 
-    if (msg->event_id == HTTP_STREAM_FINISH_REQUEST) {
-        ESP_LOGI(TAG, "[ + ] HTTP client HTTP_STREAM_FINISH_REQUEST");
-        char *buf = calloc(1, 64);
-        assert(buf);
-        int read_len = esp_http_client_read(http, buf, 64);
-        if (read_len <= 0) {
-            free(buf);
-            return ESP_FAIL;
-        }
-        buf[read_len] = 0;
-        ESP_LOGI(TAG, "Got HTTP Response = %s", (char *)buf);
-        free(buf);
-        return ESP_OK;
+    free(buf);
+    if (client_ok) {
+        httpd_resp_send_chunk(req, NULL, 0);   /* chiude chunked transfer */
     }
+
+    audio_pipeline_stop(pipeline);
+    audio_pipeline_wait_for_stop(pipeline);
+    audio_pipeline_reset_ringbuffer(pipeline);
+    audio_pipeline_reset_elements(pipeline);
+    audio_pipeline_terminate(pipeline);
+
+    ESP_LOGI(TAG, "Stream terminated");
+    xSemaphoreGive(stream_mutex);
     return ESP_OK;
 }
 
-static esp_err_t input_key_service_cb(periph_service_handle_t handle, periph_service_event_t *evt, void *ctx)
+/* ── HTTP server ──────────────────────────────────────────── */
+
+static void start_http_server(void)
 {
-    audio_element_handle_t http_stream_writer = (audio_element_handle_t)ctx;
-    if (evt->type == INPUT_KEY_SERVICE_ACTION_CLICK) {
-        switch ((int)evt->data) {
-            case INPUT_KEY_USER_ID_MODE:
-                ESP_LOGW(TAG, "[ * ] [Set] input key event, exit the demo ...");
-                xEventGroupSetBits(EXIT_FLAG, DEMO_EXIT_BIT);
-                break;
-            case INPUT_KEY_USER_ID_REC:
-                ESP_LOGE(TAG, "[ * ] [Rec] input key event, resuming pipeline ...");
-                /*
-                 * There is no effect when follow APIs output warning message on the first time record
-                 */
-                audio_pipeline_stop(pipeline);
-                audio_pipeline_wait_for_stop(pipeline);
-                audio_pipeline_reset_ringbuffer(pipeline);
-                audio_pipeline_reset_elements(pipeline);
-                audio_pipeline_terminate(pipeline);
+    httpd_config_t config  = HTTPD_DEFAULT_CONFIG();
+    config.server_port     = HTTP_PORT;
+    config.stack_size = 8192;   /* raw_stream_read + HTTP send */
 
-                audio_element_set_uri(http_stream_writer, CONFIG_SERVER_URI);
-                audio_pipeline_run(pipeline);
-                break;
-        }
-    } else if (evt->type == INPUT_KEY_SERVICE_ACTION_CLICK_RELEASE || evt->type == INPUT_KEY_SERVICE_ACTION_PRESS_RELEASE) {
-        switch ((int)evt->data) {
-            case INPUT_KEY_USER_ID_REC:
-                ESP_LOGE(TAG, "[ * ] [Rec] key released, stop pipeline ...");
-                /*
-                 * Set the i2s_stream_reader ringbuffer is done to flush the buffering voice data.
-                 */
-                audio_element_set_ringbuf_done(i2s_stream_reader);
-                break;
-        }
-    }
+    httpd_handle_t server = NULL;
+    ESP_ERROR_CHECK(httpd_start(&server, &config));
 
-    return ESP_OK;
+    httpd_uri_t audio_uri = {
+        .uri     = "/audio",
+        .method  = HTTP_GET,
+        .handler = audio_stream_handler,
+    };
+    httpd_register_uri_handler(server, &audio_uri);
+
+    ESP_LOGI(TAG, "HTTP server on port %d  →  GET /audio", HTTP_PORT);
 }
+
+/* ── app_main ─────────────────────────────────────────────── */
 
 void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set(TAG, ESP_LOG_INFO);
+    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);  /* nasconde warning di disconnect normali */
 
-    EXIT_FLAG = xEventGroupCreate();
+    stream_mutex = xSemaphoreCreateBinary();
+    xSemaphoreGive(stream_mutex);
 
+    /* NVS */
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES) {
-        // NVS partition was truncated and needs to be erased
-        // Retry nvs_flash_init
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
+
 #if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 1, 0))
     ESP_ERROR_CHECK(esp_netif_init());
 #else
     tcpip_adapter_init();
 #endif
 
-    ESP_LOGI(TAG, "[ 1 ] Initialize Button Peripheral & Connect to wifi network");
-    // Initialize peripherals management
+    /* WiFi */
+    ESP_LOGI(TAG, "[ 1 ] Connecting to WiFi...");
     esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
     esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
 
     periph_wifi_cfg_t wifi_cfg = {
-        .wifi_config.sta.ssid = CONFIG_WIFI_SSID,
+        .wifi_config.sta.ssid     = CONFIG_WIFI_SSID,
         .wifi_config.sta.password = CONFIG_WIFI_PASSWORD,
     };
     esp_periph_handle_t wifi_handle = periph_wifi_init(&wifi_cfg);
-
-    // Start wifi & button peripheral
     esp_periph_start(set, wifi_handle);
     periph_wifi_wait_for_connected(wifi_handle, portMAX_DELAY);
 
-    ESP_LOGI(TAG, "[ 2 ] Start codec chip");
-    audio_board_handle_t board_handle = audio_board_init();
-    audio_hal_ctrl_codec(board_handle->audio_hal, AUDIO_HAL_CODEC_MODE_ENCODE, AUDIO_HAL_CTRL_START);
+    /* Stampa IP */
+    esp_netif_ip_info_t ip_info = {0};
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_get_ip_info(netif, &ip_info);
+    ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&ip_info.ip));
+    ESP_LOGI(TAG, "Comando: ffplay -f s16le -ar 44100 -ac 2 http://" IPSTR ":%d/audio",
+             IP2STR(&ip_info.ip), HTTP_PORT);
 
-    ESP_LOGI(TAG, "[3.0] Create audio pipeline for recording");
+    /* Codec */
+    ESP_LOGI(TAG, "[ 2 ] Init codec");
+    audio_board_handle_t board_handle = audio_board_init();
+    audio_hal_ctrl_codec(board_handle->audio_hal,
+                         AUDIO_HAL_CODEC_MODE_ENCODE, AUDIO_HAL_CTRL_START);
+
+    /* Pipeline */
+    ESP_LOGI(TAG, "[ 3 ] Create pipeline  i2s → raw_stream");
     audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
     pipeline = audio_pipeline_init(&pipeline_cfg);
-    mem_assert(pipeline);
 
-    ESP_LOGI(TAG, "[3.1] Create http stream to post data to server");
-
-    http_stream_cfg_t http_cfg = HTTP_STREAM_CFG_DEFAULT();
-    http_cfg.type = AUDIO_STREAM_WRITER;
-    http_cfg.event_handle = _http_stream_event_handle;
-    http_stream_writer = http_stream_init(&http_cfg);
-
-    ESP_LOGI(TAG, "[3.2] Create i2s stream to read audio data from codec chip");
-    i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT_WITH_TYLE_AND_CH(CODEC_ADC_I2S_PORT, 44100, 16, AUDIO_STREAM_READER, 1);
-    i2s_cfg.type = AUDIO_STREAM_READER;
-    i2s_cfg.out_rb_size = 16 * 1024; // Increase buffer to avoid missing data in bad network conditions
+    i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT_WITH_TYLE_AND_CH(
+        CODEC_ADC_I2S_PORT, AUDIO_SAMPLE_RATE, AUDIO_BITS,
+        AUDIO_STREAM_READER, AUDIO_CHANNELS);
+    i2s_cfg.out_rb_size = 16 * 1024;
     i2s_stream_reader = i2s_stream_init(&i2s_cfg);
 
-    ESP_LOGI(TAG, "[3.3] Register all elements to audio pipeline");
+    raw_stream_cfg_t raw_cfg = RAW_STREAM_CFG_DEFAULT();
+    raw_cfg.type = AUDIO_STREAM_WRITER;
+    raw_writer = raw_stream_init(&raw_cfg);
+
     audio_pipeline_register(pipeline, i2s_stream_reader, "i2s");
-    audio_pipeline_register(pipeline, http_stream_writer, "http");
+    audio_pipeline_register(pipeline, raw_writer,         "raw");
 
-    ESP_LOGI(TAG, "[3.4] Link it together [codec_chip]-->i2s_stream->http_stream-->[http_server]");
-    const char *link_tag[2] = {"i2s", "http"};
-    audio_pipeline_link(pipeline, &link_tag[0], 2);
+    const char *link_tag[] = {"i2s", "raw"};
+    audio_pipeline_link(pipeline, link_tag, 2);
 
-    // Initialize Button peripheral
-    audio_board_key_init(set);
-    input_key_service_info_t input_key_info[] = INPUT_KEY_DEFAULT_INFO();
-    input_key_service_cfg_t input_cfg = INPUT_KEY_SERVICE_DEFAULT_CONFIG();
-    input_cfg.handle = set;
-    periph_service_handle_t input_ser = input_key_service_create(&input_cfg);
-    input_key_service_add_key(input_ser, input_key_info, INPUT_KEY_NUM);
-    periph_service_set_callback(input_ser, input_key_service_cb, (void *)http_stream_writer);
+    i2s_stream_set_clk(i2s_stream_reader, AUDIO_SAMPLE_RATE, AUDIO_BITS, AUDIO_CHANNELS);
 
-    i2s_stream_set_clk(i2s_stream_reader, EXAMPLE_AUDIO_SAMPLE_RATE, EXAMPLE_AUDIO_BITS, EXAMPLE_AUDIO_CHANNELS);
+    /* HTTP server */
+    ESP_LOGI(TAG, "[ 4 ] Start HTTP server");
+    start_http_server();
 
-    ESP_LOGI(TAG, "[ 4 ] Press [Rec] button to record, Press [Mode] to exit");
-    xEventGroupWaitBits(EXIT_FLAG, DEMO_EXIT_BIT, true, false, portMAX_DELAY);
-
-    ESP_LOGI(TAG, "[ 5 ] Stop audio_pipeline");
-    audio_pipeline_stop(pipeline);
-    audio_pipeline_wait_for_stop(pipeline);
-    audio_pipeline_terminate(pipeline);
-
-    audio_pipeline_unregister(pipeline, http_stream_writer);
-    audio_pipeline_unregister(pipeline, i2s_stream_reader);
-
-    /* Terminal the pipeline before removing the listener */
-    audio_pipeline_remove_listener(pipeline);
-
-    /* Stop all periph before removing the listener */
-    esp_periph_set_stop_all(set);
-
-    /* Release all resources */
-    audio_pipeline_deinit(pipeline);
-    audio_element_deinit(http_stream_writer);
-    audio_element_deinit(i2s_stream_reader);
-    esp_periph_set_destroy(set);
+    ESP_LOGI(TAG, "Ready — in attesa di client");
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }
