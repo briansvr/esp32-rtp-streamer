@@ -2,24 +2,58 @@ menu "Network Configuration"
 
 config WIFI_SSID
     string "WiFi SSID"
-	default "myssid"
-	help
-		SSID (network name) for the example to connect to.
+    default "myssid"
+    help
+        SSID of the Wi-Fi network to connect to.
 
 config WIFI_PASSWORD
     string "WiFi Password"
-	default "myssid"
-	help
-		WiFi password (WPA or WPA2) for the example to use.
-
-		Can be left blank if the network has no security set.
+    default "myssid"
+    help
+        Wi-Fi password (WPA/WPA2). Leave blank for open networks.
 
 config CLIENT_IP
-    string "Client IP"
-	default ""
-	help
-		IP of the client running VLC or ffplay to stream the audio to.
+    string "Client IP address"
+    default ""
+    help
+        IP address of the RTP receiver (e.g. VLC on a PC).
+        If left empty the DHCP gateway is used, which is the phone's
+        address when connected via mobile hotspot.
 
-		If left blank the gateway address will be used.
+endmenu
+
+menu "Audio Settings"
+
+config AUDIO_SAMPLE_RATE
+    int "Sample rate (Hz)"
+    default 44100
+    help
+        ADC sample rate. Must be 44100 to use standard RTP payload
+        type 11 (L16 mono), which VLC auto-detects without parameters.
+        Any other value requires manual VLC configuration.
+
+config AUDIO_CHANNELS
+    int "Channels"
+    default 1
+    range 1 2
+    help
+        1 = mono, 2 = stereo. Line-in audio is mono, so 1 is recommended.
+
+endmenu
+
+menu "RTP / Network Settings"
+
+config UDP_AUDIO_PORT
+    int "RTP destination port"
+    default 8889
+    help
+        UDP port on the receiver where VLC listens (rtp://@:<port>).
+
+config UDP_PACKET_SIZE
+    int "UDP payload size (bytes)"
+    default 1024
+    help
+        PCM bytes per UDP packet, excluding the 12-byte RTP header.
+        At 44100 Hz mono 16-bit, 1024 bytes ≈ 11.6 ms of audio per packet.
 
 endmenu
