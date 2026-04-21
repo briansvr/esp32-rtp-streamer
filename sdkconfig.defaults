@@ -23,7 +23,7 @@ CONFIG_FREERTOS_HZ=1000
 # Partition Table
 #
 CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_raw_http_example.csv"
-CONFIG_PARTITION_TABLE_FILENAME="partitions_raw_http_example.csv"
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_esp32_rtp_streamer.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_esp32_rtp_streamer.csv"
 CONFIG_PARTITION_TABLE_MD5=y
 # end of Partition Table
