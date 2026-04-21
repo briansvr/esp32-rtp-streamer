@@ -1,12 +1,13 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "nvs_flash.h"
-#include "esp_http_server.h"
+#include "lwip/sockets.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
 #include "sdkconfig.h"
 
 #include "audio_element.h"
@@ -15,10 +16,9 @@
 #include "board.h"
 #include "i2s_stream.h"
 #include "raw_stream.h"
-#include "es8388.h"
-#include "ringbuf.h"
 #include "esp_peripherals.h"
 #include "periph_wifi.h"
+#include "es8388.h"
 #include "audio_idf_version.h"
 
 #if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 1, 0))
@@ -27,139 +27,138 @@
 #include "tcpip_adapter.h"
 #endif
 
-static const char *TAG = "HTTP_AUDIO_SERVER";
+static const char *TAG = "UDP_AUDIO";
 
-#define AUDIO_SAMPLE_RATE   (48000)
-#define AUDIO_BITS          (16)
-#define AUDIO_CHANNELS      (2)
-#define HTTP_PORT           (8080)
-#define STREAM_BUF_SIZE     (4096)
+#define AUDIO_SAMPLE_RATE (48000)
+#define AUDIO_BITS (16)
+#define AUDIO_CHANNELS (2)
+#define UDP_REG_PORT   (8888)   /* porta su cui ESP32 ascolta le registrazioni */
+#define UDP_AUDIO_PORT (8889)   /* porta su cui il client ascolta l'audio       */
+#define UDP_PACKET_SIZE (1024)  /* ~5ms di audio per pacchetto */
 
-static audio_pipeline_handle_t pipeline;
-static audio_element_handle_t  i2s_stream_reader;
-static audio_element_handle_t  raw_writer;
+static audio_element_handle_t raw_writer;
+static audio_element_handle_t i2s_stream_reader;
 
-static SemaphoreHandle_t stream_mutex;   /* garantisce un solo client alla volta */
+/* ── Task UDP sender ──────────────────────────────────────── */
 
-/* ── WAV header per streaming (size = 0x7FFFFFFF) ────────── */
+/*
+ * Il client si registra inviando qualsiasi pacchetto UDP alla porta UDP_PORT.
+ * L'ESP32 risponde con audio unicast verso quell'IP:porta_client.
+ * Se il client non manda keepalive entro CLIENT_TIMEOUT_S, viene rimosso.
+ */
+#define CLIENT_TIMEOUT_S 5
 
-static void send_wav_header(httpd_req_t *req)
+static void udp_sender_task(void *arg)
 {
-    const uint32_t sr   = AUDIO_SAMPLE_RATE;
-    const uint16_t ch   = AUDIO_CHANNELS;
-    const uint16_t bps  = AUDIO_BITS;
-    const uint32_t br   = sr * ch * (bps / 8);
-    const uint16_t ba   = ch * (bps / 8);
-    const uint32_t INF  = 0x7FFFFFFF;
-
-    uint8_t hdr[44] = {
-        'R','I','F','F',
-        INF & 0xFF, (INF>>8)&0xFF, (INF>>16)&0xFF, (INF>>24)&0xFF,
-        'W','A','V','E',
-        'f','m','t',' ',
-        16,0,0,0,
-        1,0,
-        ch  & 0xFF, (ch >>8)&0xFF,
-        sr  & 0xFF, (sr >>8)&0xFF, (sr >>16)&0xFF, (sr >>24)&0xFF,
-        br  & 0xFF, (br >>8)&0xFF, (br >>16)&0xFF, (br >>24)&0xFF,
-        ba  & 0xFF, (ba >>8)&0xFF,
-        bps & 0xFF, (bps>>8)&0xFF,
-        'd','a','t','a',
-        INF & 0xFF, (INF>>8)&0xFF, (INF>>16)&0xFF, (INF>>24)&0xFF,
+    /* socket di ascolto (riceve registrazioni / keepalive) */
+    int rx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    struct sockaddr_in rx_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(UDP_REG_PORT),
+        .sin_addr.s_addr = INADDR_ANY,
     };
-    httpd_resp_send_chunk(req, (char *)hdr, sizeof(hdr));
-}
+    bind(rx_sock, (struct sockaddr *)&rx_addr, sizeof(rx_addr));
 
-/* ── HTTP handler ─────────────────────────────────────────── */
+    /* timeout su recvfrom così non blocca il loop */
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 1000};
+    setsockopt(rx_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-static esp_err_t audio_stream_handler(httpd_req_t *req)
-{
-    if (xSemaphoreTake(stream_mutex, 0) == pdFALSE) {
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        httpd_resp_sendstr(req, "Already streaming to another client");
-        return ESP_OK;
-    }
+    /* socket di invio (trasmette audio unicast) */
+    int tx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
 
-    ESP_LOGI(TAG, "Client connected — starting stream");
+    struct sockaddr_in client = {0};
+    int64_t client_last_seen = 0;
+    bool has_client = false;
 
-    httpd_resp_set_type(req, "audio/wav");
+    char buf[UDP_PACKET_SIZE];
+    char rx_buf[16];
 
-    audio_pipeline_run(pipeline);
-    send_wav_header(req);
+    /* ── statistiche ────────────────────────────────────── */
+    uint32_t stat_sent = 0, stat_fail = 0, stat_short = 0;
+    int64_t stat_gap_max = 0, stat_gap_min = INT64_MAX;
+    int64_t last_send_us = 0, stat_window = esp_timer_get_time();
 
-    char *buf = malloc(STREAM_BUF_SIZE);
-    if (!buf) {
-        audio_pipeline_stop(pipeline);
-        audio_pipeline_wait_for_stop(pipeline);
-        audio_pipeline_terminate(pipeline);
-        xSemaphoreGive(stream_mutex);
-        return ESP_ERR_NO_MEM;
-    }
+    ESP_LOGI(TAG, "In ascolto su UDP :%d — invia un pacchetto per registrarti", UDP_REG_PORT);
 
-    ringbuf_handle_t rb = audio_element_get_output_ringbuf(i2s_stream_reader);
-    int monitor_bytes = 0;
-    const int LOG_INTERVAL = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * (AUDIO_BITS / 8); /* ~1 secondo */
+    while (1)
+    {
+        /* controlla nuovi client / keepalive */
+        struct sockaddr_in sender = {0};
+        socklen_t sender_len = sizeof(sender);
+        int rx = recvfrom(rx_sock, rx_buf, sizeof(rx_buf), 0,
+                          (struct sockaddr *)&sender, &sender_len);
+        if (rx > 0)
+        {
+            int64_t now_s = esp_timer_get_time() / 1000000LL;
+            if (!has_client || sender.sin_addr.s_addr != client.sin_addr.s_addr)
+            {
+                ESP_LOGI(TAG, "Client registrato: " IPSTR ":%d",
+                         IP2STR((ip4_addr_t *)&sender.sin_addr),
+                         ntohs(sender.sin_port));
+            }
+            client = sender;
+            client.sin_port = htons(UDP_AUDIO_PORT);  /* audio sempre su porta fissa */
+            client_last_seen = now_s;
+            has_client = true;
+        }
 
-    bool client_ok = true;
-    while (1) {
-        int len = raw_stream_read(raw_writer, buf, STREAM_BUF_SIZE);
-        if (len <= 0) break;   /* pipeline fermata o errore */
-
-        monitor_bytes += len;
-        if (monitor_bytes >= LOG_INTERVAL) {
-            monitor_bytes = 0;
-            if (rb) {
-                int filled    = rb_bytes_filled(rb);
-                int available = rb_bytes_available(rb);
-                int total     = rb_get_size(rb);
-                int pct       = (filled * 100) / total;
-                ESP_LOGI(TAG, "RB: %d/%d bytes (%d%% pieno)  libero=%d",
-                         filled, total, pct, available);
+        /* timeout client */
+        if (has_client)
+        {
+            int64_t now_s = esp_timer_get_time() / 1000000LL;
+            if ((now_s - client_last_seen) >= CLIENT_TIMEOUT_S)
+            {
+                ESP_LOGI(TAG, "Client timeout — in attesa di nuova registrazione");
+                has_client = false;
             }
         }
 
-        if (httpd_resp_send_chunk(req, buf, len) != ESP_OK) {
-            ESP_LOGI(TAG, "Client disconnected");
-            client_ok = false;
-            break;
+        /* leggi audio dal pipeline */
+        int len = raw_stream_read(raw_writer, buf, sizeof(buf));
+        if (len <= 0)
+            continue;
+        if (len < UDP_PACKET_SIZE)
+            stat_short++;
+
+        if (!has_client)
+            continue; /* nessun client: scarta e tieni il buffer svuotato */
+
+        int64_t now = esp_timer_get_time();
+        if (last_send_us > 0)
+        {
+            int64_t gap = now - last_send_us;
+            if (gap > stat_gap_max)
+                stat_gap_max = gap;
+            if (gap < stat_gap_min)
+                stat_gap_min = gap;
+        }
+        last_send_us = now;
+
+        int ret = sendto(tx_sock, buf, len, 0,
+                         (struct sockaddr *)&client, sizeof(client));
+        if (ret < 0)
+            stat_fail++;
+        else
+            stat_sent++;
+
+        /* log ogni secondo */
+        if ((now - stat_window) >= 1000000LL)
+        {
+            ESP_LOGI(TAG,
+                     "1s: sent=%" PRIu32 " fail=%" PRIu32 " short=%" PRIu32
+                     " | gap min=%" PRId64 "µs max=%" PRId64 "µs",
+                     stat_sent, stat_fail, stat_short,
+                     stat_gap_min == INT64_MAX ? 0 : stat_gap_min, stat_gap_max);
+            stat_sent = stat_fail = stat_short = 0;
+            stat_gap_max = 0;
+            stat_gap_min = INT64_MAX;
+            stat_window = now;
         }
     }
 
-    free(buf);
-    if (client_ok) {
-        httpd_resp_send_chunk(req, NULL, 0);   /* chiude chunked transfer */
-    }
-
-    audio_pipeline_stop(pipeline);
-    audio_pipeline_wait_for_stop(pipeline);
-    audio_pipeline_reset_ringbuffer(pipeline);
-    audio_pipeline_reset_elements(pipeline);
-    audio_pipeline_terminate(pipeline);
-
-    ESP_LOGI(TAG, "Stream terminated");
-    xSemaphoreGive(stream_mutex);
-    return ESP_OK;
-}
-
-/* ── HTTP server ──────────────────────────────────────────── */
-
-static void start_http_server(void)
-{
-    httpd_config_t config  = HTTPD_DEFAULT_CONFIG();
-    config.server_port     = HTTP_PORT;
-    config.stack_size = 8192;   /* raw_stream_read + HTTP send */
-
-    httpd_handle_t server = NULL;
-    ESP_ERROR_CHECK(httpd_start(&server, &config));
-
-    httpd_uri_t audio_uri = {
-        .uri     = "/audio",
-        .method  = HTTP_GET,
-        .handler = audio_stream_handler,
-    };
-    httpd_register_uri_handler(server, &audio_uri);
-
-    ESP_LOGI(TAG, "HTTP server on port %d  →  GET /audio", HTTP_PORT);
+    close(rx_sock);
+    close(tx_sock);
+    vTaskDelete(NULL);
 }
 
 /* ── app_main ─────────────────────────────────────────────── */
@@ -168,14 +167,11 @@ void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set(TAG, ESP_LOG_INFO);
-    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);  /* nasconde warning di disconnect normali */
-
-    stream_mutex = xSemaphoreCreateBinary();
-    xSemaphoreGive(stream_mutex);
 
     /* NVS */
     esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES) {
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES)
+    {
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
@@ -192,37 +188,44 @@ void app_main(void)
     esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
 
     periph_wifi_cfg_t wifi_cfg = {
-        .wifi_config.sta.ssid     = CONFIG_WIFI_SSID,
+        .wifi_config.sta.ssid = CONFIG_WIFI_SSID,
         .wifi_config.sta.password = CONFIG_WIFI_PASSWORD,
     };
     esp_periph_handle_t wifi_handle = periph_wifi_init(&wifi_cfg);
     esp_periph_start(set, wifi_handle);
     periph_wifi_wait_for_connected(wifi_handle, portMAX_DELAY);
+    esp_wifi_set_ps(WIFI_PS_NONE); /* disabilita power save → niente gap nel TX */
 
-    /* Stampa IP */
+    /* IP e broadcast */
     esp_netif_ip_info_t ip_info = {0};
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     esp_netif_get_ip_info(netif, &ip_info);
+
+    // uint32_t broadcast_ip = ip_info.ip.addr | ~ip_info.netmask.addr;
+
     ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&ip_info.ip));
-    ESP_LOGI(TAG, "Comando: ffplay -f s16le -ar 44100 -ac 2 http://" IPSTR ":%d/audio",
-             IP2STR(&ip_info.ip), HTTP_PORT);
+    ESP_LOGI(TAG, "1) Registrati (keepalive ogni ~3s):  echo r | nc -u " IPSTR " %d", IP2STR(&ip_info.ip), UDP_REG_PORT);
+    ESP_LOGI(TAG, "2) Ascolta ffplay:  ffplay -f s16le -ar 48000 -ac 2 udp://0.0.0.0:%d", UDP_AUDIO_PORT);
+    ESP_LOGI(TAG, "   Ascolta VLC:     vlc --demux=rawaud --rawaud-channels=2 --rawaud-samplerate=48000 --rawaud-fourcc=s16l udp://@:%d", UDP_AUDIO_PORT);
 
     /* Codec */
     ESP_LOGI(TAG, "[ 2 ] Init codec");
     audio_board_handle_t board_handle = audio_board_init();
     audio_hal_ctrl_codec(board_handle->audio_hal,
                          AUDIO_HAL_CODEC_MODE_ENCODE, AUDIO_HAL_CTRL_START);
-    es8388_set_mic_gain(MIC_GAIN_24DB);   /* aumenta gain ADC per line-in */
+
+    es8388_set_mic_gain(MIC_GAIN_24DB);
+    es8388_config_adc_input(ADC_INPUT_LINPUT2_RINPUT2);  /* AudioKit: line-in sui jack LIN2/RIN2 */
 
     /* Pipeline */
     ESP_LOGI(TAG, "[ 3 ] Create pipeline  i2s → raw_stream");
     audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
-    pipeline = audio_pipeline_init(&pipeline_cfg);
+    audio_pipeline_handle_t pipeline = audio_pipeline_init(&pipeline_cfg);
 
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT_WITH_TYLE_AND_CH(
         CODEC_ADC_I2S_PORT, AUDIO_SAMPLE_RATE, AUDIO_BITS,
         AUDIO_STREAM_READER, AUDIO_CHANNELS);
-    i2s_cfg.out_rb_size = 2 * 1024;   /* buffer piccolo = latenza minima */
+    i2s_cfg.out_rb_size = 2 * 1024;
     i2s_stream_reader = i2s_stream_init(&i2s_cfg);
 
     raw_stream_cfg_t raw_cfg = RAW_STREAM_CFG_DEFAULT();
@@ -230,19 +233,22 @@ void app_main(void)
     raw_writer = raw_stream_init(&raw_cfg);
 
     audio_pipeline_register(pipeline, i2s_stream_reader, "i2s");
-    audio_pipeline_register(pipeline, raw_writer,         "raw");
+    audio_pipeline_register(pipeline, raw_writer, "raw");
 
     const char *link_tag[] = {"i2s", "raw"};
     audio_pipeline_link(pipeline, link_tag, 2);
 
     i2s_stream_set_clk(i2s_stream_reader, AUDIO_SAMPLE_RATE, AUDIO_BITS, AUDIO_CHANNELS);
 
-    /* HTTP server */
-    ESP_LOGI(TAG, "[ 4 ] Start HTTP server");
-    start_http_server();
+    /* Avvia pipeline subito — sempre in esecuzione */
+    audio_pipeline_run(pipeline);
+    ESP_LOGI(TAG, "[ 4 ] Pipeline avviata");
 
-    ESP_LOGI(TAG, "Ready — in attesa di client");
-    while (1) {
+    xTaskCreate(udp_sender_task, "udp_sender", 4096, NULL, 5, NULL);
+
+    ESP_LOGI(TAG, "Ready — streaming UDP in corso");
+    while (1)
+    {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
