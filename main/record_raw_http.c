@@ -15,6 +15,8 @@
 #include "board.h"
 #include "i2s_stream.h"
 #include "raw_stream.h"
+#include "es8388.h"
+#include "ringbuf.h"
 #include "esp_peripherals.h"
 #include "periph_wifi.h"
 #include "audio_idf_version.h"
@@ -27,7 +29,7 @@
 
 static const char *TAG = "HTTP_AUDIO_SERVER";
 
-#define AUDIO_SAMPLE_RATE   (44100)
+#define AUDIO_SAMPLE_RATE   (48000)
 #define AUDIO_BITS          (16)
 #define AUDIO_CHANNELS      (2)
 #define HTTP_PORT           (8080)
@@ -94,10 +96,27 @@ static esp_err_t audio_stream_handler(httpd_req_t *req)
         return ESP_ERR_NO_MEM;
     }
 
+    ringbuf_handle_t rb = audio_element_get_output_ringbuf(i2s_stream_reader);
+    int monitor_bytes = 0;
+    const int LOG_INTERVAL = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * (AUDIO_BITS / 8); /* ~1 secondo */
+
     bool client_ok = true;
     while (1) {
         int len = raw_stream_read(raw_writer, buf, STREAM_BUF_SIZE);
         if (len <= 0) break;   /* pipeline fermata o errore */
+
+        monitor_bytes += len;
+        if (monitor_bytes >= LOG_INTERVAL) {
+            monitor_bytes = 0;
+            if (rb) {
+                int filled    = rb_bytes_filled(rb);
+                int available = rb_bytes_available(rb);
+                int total     = rb_get_size(rb);
+                int pct       = (filled * 100) / total;
+                ESP_LOGI(TAG, "RB: %d/%d bytes (%d%% pieno)  libero=%d",
+                         filled, total, pct, available);
+            }
+        }
 
         if (httpd_resp_send_chunk(req, buf, len) != ESP_OK) {
             ESP_LOGI(TAG, "Client disconnected");
@@ -193,6 +212,7 @@ void app_main(void)
     audio_board_handle_t board_handle = audio_board_init();
     audio_hal_ctrl_codec(board_handle->audio_hal,
                          AUDIO_HAL_CODEC_MODE_ENCODE, AUDIO_HAL_CTRL_START);
+    es8388_set_mic_gain(MIC_GAIN_24DB);   /* aumenta gain ADC per line-in */
 
     /* Pipeline */
     ESP_LOGI(TAG, "[ 3 ] Create pipeline  i2s → raw_stream");
@@ -202,7 +222,7 @@ void app_main(void)
     i2s_stream_cfg_t i2s_cfg = I2S_STREAM_CFG_DEFAULT_WITH_TYLE_AND_CH(
         CODEC_ADC_I2S_PORT, AUDIO_SAMPLE_RATE, AUDIO_BITS,
         AUDIO_STREAM_READER, AUDIO_CHANNELS);
-    i2s_cfg.out_rb_size = 16 * 1024;
+    i2s_cfg.out_rb_size = 2 * 1024;   /* buffer piccolo = latenza minima */
     i2s_stream_reader = i2s_stream_init(&i2s_cfg);
 
     raw_stream_cfg_t raw_cfg = RAW_STREAM_CFG_DEFAULT();
