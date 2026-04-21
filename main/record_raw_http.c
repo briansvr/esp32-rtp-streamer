@@ -8,6 +8,7 @@
 #include "lwip/sockets.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_http_server.h"
 #include "sdkconfig.h"
 
 #include "audio_element.h"
@@ -29,90 +30,37 @@
 
 static const char *TAG = "UDP_AUDIO";
 
-#define AUDIO_SAMPLE_RATE (48000)
-#define AUDIO_BITS (16)
-#define AUDIO_CHANNELS (2)
-#define UDP_REG_PORT   (8888)   /* porta su cui ESP32 ascolta le registrazioni */
-#define UDP_AUDIO_PORT (8889)   /* porta su cui il client ascolta l'audio       */
-#define UDP_PACKET_SIZE (1024)  /* ~5ms di audio per pacchetto */
+#define AUDIO_SAMPLE_RATE  (48000)
+#define AUDIO_BITS         (16)
+#define AUDIO_CHANNELS     (1)
+#define UDP_AUDIO_PORT     (8889)   /* porta su cui il telefono ascolta l'audio */
+#define UDP_PACKET_SIZE    (1024)
+#define HTTP_PORT          (8080)   /* serve solo la playlist XSPF */
 
 static audio_element_handle_t raw_writer;
 static audio_element_handle_t i2s_stream_reader;
 
-/* ── Task UDP sender ──────────────────────────────────────── */
+/* indirizzo del telefono — impostato in app_main dal gateway DHCP */
+static struct sockaddr_in s_target_addr;
 
-/*
- * Il client si registra inviando qualsiasi pacchetto UDP alla porta UDP_PORT.
- * L'ESP32 risponde con audio unicast verso quell'IP:porta_client.
- * Se il client non manda keepalive entro CLIENT_TIMEOUT_S, viene rimosso.
- */
-#define CLIENT_TIMEOUT_S 5
+/* ── Task UDP sender ──────────────────────────────────────── */
 
 static void udp_sender_task(void *arg)
 {
-    /* socket di ascolto (riceve registrazioni / keepalive) */
-    int rx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    struct sockaddr_in rx_addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(UDP_REG_PORT),
-        .sin_addr.s_addr = INADDR_ANY,
-    };
-    bind(rx_sock, (struct sockaddr *)&rx_addr, sizeof(rx_addr));
-
-    /* timeout su recvfrom così non blocca il loop */
-    struct timeval tv = {.tv_sec = 0, .tv_usec = 1000};
-    setsockopt(rx_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    /* socket di invio (trasmette audio unicast) */
     int tx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
 
-    struct sockaddr_in client = {0};
-    int64_t client_last_seen = 0;
-    bool has_client = false;
-
     char buf[UDP_PACKET_SIZE];
-    char rx_buf[16];
 
     /* ── statistiche ────────────────────────────────────── */
     uint32_t stat_sent = 0, stat_fail = 0, stat_short = 0;
     int64_t stat_gap_max = 0, stat_gap_min = INT64_MAX;
     int64_t last_send_us = 0, stat_window = esp_timer_get_time();
 
-    ESP_LOGI(TAG, "In ascolto su UDP :%d — invia un pacchetto per registrarti", UDP_REG_PORT);
+    ESP_LOGI(TAG, "Streaming → " IPSTR ":%d",
+             IP2STR((ip4_addr_t *)&s_target_addr.sin_addr), UDP_AUDIO_PORT);
 
     while (1)
     {
-        /* controlla nuovi client / keepalive */
-        struct sockaddr_in sender = {0};
-        socklen_t sender_len = sizeof(sender);
-        int rx = recvfrom(rx_sock, rx_buf, sizeof(rx_buf), 0,
-                          (struct sockaddr *)&sender, &sender_len);
-        if (rx > 0)
-        {
-            int64_t now_s = esp_timer_get_time() / 1000000LL;
-            if (!has_client || sender.sin_addr.s_addr != client.sin_addr.s_addr)
-            {
-                ESP_LOGI(TAG, "Client registrato: " IPSTR ":%d",
-                         IP2STR((ip4_addr_t *)&sender.sin_addr),
-                         ntohs(sender.sin_port));
-            }
-            client = sender;
-            client.sin_port = htons(UDP_AUDIO_PORT);  /* audio sempre su porta fissa */
-            client_last_seen = now_s;
-            has_client = true;
-        }
-
-        /* timeout client */
-        if (has_client)
-        {
-            int64_t now_s = esp_timer_get_time() / 1000000LL;
-            if ((now_s - client_last_seen) >= CLIENT_TIMEOUT_S)
-            {
-                ESP_LOGI(TAG, "Client timeout — in attesa di nuova registrazione");
-                has_client = false;
-            }
-        }
-
         /* leggi audio dal pipeline */
         int len = raw_stream_read(raw_writer, buf, sizeof(buf));
         if (len <= 0)
@@ -120,26 +68,19 @@ static void udp_sender_task(void *arg)
         if (len < UDP_PACKET_SIZE)
             stat_short++;
 
-        if (!has_client)
-            continue; /* nessun client: scarta e tieni il buffer svuotato */
-
         int64_t now = esp_timer_get_time();
         if (last_send_us > 0)
         {
             int64_t gap = now - last_send_us;
-            if (gap > stat_gap_max)
-                stat_gap_max = gap;
-            if (gap < stat_gap_min)
-                stat_gap_min = gap;
+            if (gap > stat_gap_max) stat_gap_max = gap;
+            if (gap < stat_gap_min) stat_gap_min = gap;
         }
         last_send_us = now;
 
         int ret = sendto(tx_sock, buf, len, 0,
-                         (struct sockaddr *)&client, sizeof(client));
-        if (ret < 0)
-            stat_fail++;
-        else
-            stat_sent++;
+                         (struct sockaddr *)&s_target_addr, sizeof(s_target_addr));
+        if (ret < 0) stat_fail++;
+        else         stat_sent++;
 
         /* log ogni secondo */
         if ((now - stat_window) >= 1000000LL)
@@ -156,9 +97,54 @@ static void udp_sender_task(void *arg)
         }
     }
 
-    close(rx_sock);
     close(tx_sock);
     vTaskDelete(NULL);
+}
+
+/* ── Playlist XSPF ───────────────────────────────────────────
+ * VLC mobile apre http://ip:8080/ → scarica questo file →
+ * si connette da solo a udp://@:8889 con i parametri corretti.
+ * ────────────────────────────────────────────────────────── */
+
+static esp_err_t playlist_handler(httpd_req_t *req)
+{
+    char body[640];
+    snprintf(body, sizeof(body),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<playlist version=\"1\""
+        " xmlns=\"http://xspf.org/ns/0/\""
+        " xmlns:vlc=\"http://www.videolan.org/vlc/playlist/ns/0/\">\n"
+        "  <trackList><track>\n"
+        "    <location>udp://@:%d</location>\n"
+        "    <extension application=\"http://www.videolan.org/vlc/playlist/0\">\n"
+        "      <vlc:option>demux=rawaud</vlc:option>\n"
+        "      <vlc:option>rawaud-channels=%d</vlc:option>\n"
+        "      <vlc:option>rawaud-samplerate=%d</vlc:option>\n"
+        "      <vlc:option>rawaud-fourcc=s16l</vlc:option>\n"
+        "    </extension>\n"
+        "  </track></trackList>\n"
+        "</playlist>\n",
+        UDP_AUDIO_PORT, AUDIO_CHANNELS, AUDIO_SAMPLE_RATE);
+
+    httpd_resp_set_type(req, "application/xspf+xml");
+    httpd_resp_sendstr(req, body);
+    return ESP_OK;
+}
+
+static void start_playlist_server(void)
+{
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.server_port = HTTP_PORT;
+
+    httpd_handle_t server = NULL;
+    ESP_ERROR_CHECK(httpd_start(&server, &cfg));
+
+    httpd_uri_t uri = {
+        .uri     = "/",
+        .method  = HTTP_GET,
+        .handler = playlist_handler,
+    };
+    httpd_register_uri_handler(server, &uri);
 }
 
 /* ── app_main ─────────────────────────────────────────────── */
@@ -188,34 +174,47 @@ void app_main(void)
     esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
 
     periph_wifi_cfg_t wifi_cfg = {
-        .wifi_config.sta.ssid = CONFIG_WIFI_SSID,
+        .wifi_config.sta.ssid     = CONFIG_WIFI_SSID,
         .wifi_config.sta.password = CONFIG_WIFI_PASSWORD,
     };
     esp_periph_handle_t wifi_handle = periph_wifi_init(&wifi_cfg);
     esp_periph_start(set, wifi_handle);
     periph_wifi_wait_for_connected(wifi_handle, portMAX_DELAY);
-    esp_wifi_set_ps(WIFI_PS_NONE); /* disabilita power save → niente gap nel TX */
+    esp_wifi_set_ps(WIFI_PS_NONE);
 
-    /* IP e broadcast */
+    /* Ricava IP proprio e gateway (= telefono con hotspot) */
     esp_netif_ip_info_t ip_info = {0};
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     esp_netif_get_ip_info(netif, &ip_info);
 
-    // uint32_t broadcast_ip = ip_info.ip.addr | ~ip_info.netmask.addr;
+    /* Destinazione: CLIENT_IP da menuconfig, oppure gateway DHCP */
+    memset(&s_target_addr, 0, sizeof(s_target_addr));
+    s_target_addr.sin_family = AF_INET;
+    s_target_addr.sin_port   = htons(UDP_AUDIO_PORT);
 
-    ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&ip_info.ip));
-    ESP_LOGI(TAG, "1) Registrati (keepalive ogni ~3s):  echo r | nc -u " IPSTR " %d", IP2STR(&ip_info.ip), UDP_REG_PORT);
-    ESP_LOGI(TAG, "2) Ascolta ffplay:  ffplay -f s16le -ar 48000 -ac 2 udp://0.0.0.0:%d", UDP_AUDIO_PORT);
-    ESP_LOGI(TAG, "   Ascolta VLC:     vlc --demux=rawaud --rawaud-channels=2 --rawaud-samplerate=48000 --rawaud-fourcc=s16l udp://@:%d", UDP_AUDIO_PORT);
+    if (strlen(CONFIG_CLIENT_IP) > 0) {
+        s_target_addr.sin_addr.s_addr = inet_addr(CONFIG_CLIENT_IP);
+        ESP_LOGI(TAG, "Destinazione: %s (da menuconfig)", CONFIG_CLIENT_IP);
+    } else {
+        s_target_addr.sin_addr.s_addr = ip_info.gw.addr;
+        ESP_LOGI(TAG, "Destinazione: " IPSTR " (gateway)", IP2STR(&ip_info.gw));
+    }
+
+    ESP_LOGI(TAG, "IP ESP32:  " IPSTR, IP2STR(&ip_info.ip));
+    ESP_LOGI(TAG, "VLC mobile:  apri http://" IPSTR ":%d/  (playlist automatica)",
+             IP2STR(&ip_info.ip), HTTP_PORT);
+    ESP_LOGI(TAG, "ffplay:      ffplay -f s16le -ar 48000 -ac 1 udp://0.0.0.0:%d", UDP_AUDIO_PORT);
+    ESP_LOGI(TAG, "VLC desktop: vlc --demux=rawaud --rawaud-channels=1 --rawaud-samplerate=48000 --rawaud-fourcc=s16l udp://@:%d", UDP_AUDIO_PORT);
 
     /* Codec */
     ESP_LOGI(TAG, "[ 2 ] Init codec");
     audio_board_handle_t board_handle = audio_board_init();
     audio_hal_ctrl_codec(board_handle->audio_hal,
-                         AUDIO_HAL_CODEC_MODE_ENCODE, AUDIO_HAL_CTRL_START);
+                         AUDIO_HAL_CODEC_MODE_BOTH, AUDIO_HAL_CTRL_START);
 
-    es8388_set_mic_gain(MIC_GAIN_24DB);
-    es8388_config_adc_input(ADC_INPUT_LINPUT2_RINPUT2);  /* AudioKit: line-in sui jack LIN2/RIN2 */
+    es8388_set_mic_gain(MIC_GAIN_0DB);
+    es8388_config_adc_input(ADC_INPUT_LINPUT2_RINPUT2);
+    es8388_write_reg(ES8388_ADCPOWER, 0x09);
 
     /* Pipeline */
     ESP_LOGI(TAG, "[ 3 ] Create pipeline  i2s → raw_stream");
@@ -240,15 +239,14 @@ void app_main(void)
 
     i2s_stream_set_clk(i2s_stream_reader, AUDIO_SAMPLE_RATE, AUDIO_BITS, AUDIO_CHANNELS);
 
-    /* Avvia pipeline subito — sempre in esecuzione */
     audio_pipeline_run(pipeline);
     ESP_LOGI(TAG, "[ 4 ] Pipeline avviata");
 
+    start_playlist_server();
     xTaskCreate(udp_sender_task, "udp_sender", 4096, NULL, 5, NULL);
 
-    ESP_LOGI(TAG, "Ready — streaming UDP in corso");
-    while (1)
-    {
+    ESP_LOGI(TAG, "Ready — streaming UDP verso il telefono");
+    while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }

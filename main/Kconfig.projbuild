@@ -1,4 +1,4 @@
-menu "Example Configuration"
+menu "Network Configuration"
 
 config WIFI_SSID
     string "WiFi SSID"
@@ -14,11 +14,12 @@ config WIFI_PASSWORD
 
 		Can be left blank if the network has no security set.
 
-config SERVER_URI
-    string "Server URL to send data"
-    default "http://192.168.0.248:8000/upload"
-    help
-        Server URL to send data
+config CLIENT_IP
+    string "Client IP"
+	default ""
+	help
+		IP of the client running VLC or ffplay to stream the audio to.
 
+		If left blank the gateway address will be used.
 
 endmenu
